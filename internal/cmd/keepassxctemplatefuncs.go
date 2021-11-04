@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/coreos/go-semver/semver"
+	"github.com/twpayne/chezmoi/v2/internal/chezmoi"
 )
 
 // FIXME use chezmoi.AbsPath for keepassxcConfig.Database
@@ -21,7 +22,7 @@ type keepassxcAttributeCacheKey struct {
 
 type keepassxcConfig struct {
 	Command        string
-	Database       string
+	Database       chezmoi.AbsPath
 	Args           []string
 	version        *semver.Version
 	cache          map[string]map[string]string
@@ -42,7 +43,7 @@ func (c *Config) keepassxcAttributeTemplateFunc(entry, attribute string) string 
 	if data, ok := c.Keepassxc.attributeCache[key]; ok {
 		return data
 	}
-	if c.Keepassxc.Database == "" {
+	if c.Keepassxc.Database.Empty() {
 		returnTemplateError(errors.New("keepassxc.database not set"))
 		return ""
 	}
@@ -52,7 +53,7 @@ func (c *Config) keepassxcAttributeTemplateFunc(entry, attribute string) string 
 		args = append(args, "--show-protected")
 	}
 	args = append(args, c.Keepassxc.Args...)
-	args = append(args, c.Keepassxc.Database, entry)
+	args = append(args, c.Keepassxc.Database.String(), entry)
 	output, err := c.runKeepassxcCLICommand(name, args)
 	if err != nil {
 		returnTemplateError(fmt.Errorf("%s: %w", shellQuoteCommand(name, args), err))
@@ -70,7 +71,7 @@ func (c *Config) keepassxcTemplateFunc(entry string) map[string]string {
 	if data, ok := c.Keepassxc.cache[entry]; ok {
 		return data
 	}
-	if c.Keepassxc.Database == "" {
+	if c.Keepassxc.Database.Empty() {
 		returnTemplateError(errors.New("keepassxc.database not set"))
 		return nil
 	}
@@ -80,7 +81,7 @@ func (c *Config) keepassxcTemplateFunc(entry string) map[string]string {
 		args = append(args, "--show-protected")
 	}
 	args = append(args, c.Keepassxc.Args...)
-	args = append(args, c.Keepassxc.Database, entry)
+	args = append(args, c.Keepassxc.Database.String(), entry)
 	output, err := c.runKeepassxcCLICommand(name, args)
 	if err != nil {
 		returnTemplateError(fmt.Errorf("%s: %w", shellQuoteCommand(name, args), err))

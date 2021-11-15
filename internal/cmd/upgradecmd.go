@@ -1,43 +1,45 @@
-//go:build !noupgrade && !windows
-// +build !noupgrade,!windows
+//go:build !noupgrade
+// +build !noupgrade
 
 package cmd
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strings"
-	"syscall"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/google/go-github/v40/github"
 	"github.com/spf13/cobra"
 	vfs "github.com/twpayne/go-vfs/v4"
-	"go.uber.org/multierr"
-	"golang.org/x/sys/unix"
 
+	"github.com/twpayne/chezmoi/v2/internal/archive"
 	"github.com/twpayne/chezmoi/v2/internal/chezmoi"
 )
 
 const (
+	// FIXME detect privilege escalation method until it's needed.
+	upgradeMethodPfexecPrefix = "pfexec-"
+	upgradeMethodSudoPrefix   = "sudo-"
+
+	// FIXME add Chocolately.
+	// FIXME add Scoop.
 	upgradeMethodBrewUpgrade       = "brew-upgrade"
 	upgradeMethodReplaceExecutable = "replace-executable"
 	upgradeMethodSnapRefresh       = "snap-refresh"
 	upgradeMethodUpgradePackage    = "upgrade-package"
-	upgradeMethodSudoPrefix        = "sudo-"
 
 	libcTypeGlibc = "glibc"
 	libcTypeMusl  = "musl"
@@ -82,9 +84,10 @@ var (
 )
 
 type upgradeCmdConfig struct {
-	method string
-	owner  string
-	repo   string
+	executable string
+	method     string
+	owner      string
+	repo       string
 }
 
 func (c *Config) newUpgradeCmd() *cobra.Command {
@@ -101,6 +104,7 @@ func (c *Config) newUpgradeCmd() *cobra.Command {
 	}
 
 	flags := upgradeCmd.Flags()
+	flags.StringVar(&c.upgrade.executable, "executable", c.upgrade.method, "Set executable to replace")
 	flags.StringVar(&c.upgrade.method, "method", c.upgrade.method, "Set upgrade method")
 	flags.StringVar(&c.upgrade.owner, "owner", c.upgrade.owner, "Set owner")
 	flags.StringVar(&c.upgrade.repo, "repo", c.upgrade.repo, "Set repo")
@@ -136,11 +140,15 @@ func (c *Config) runUpgradeCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Determine the upgrade method to use.
-	executable, err := os.Executable()
-	if err != nil {
-		return err
+	if c.upgrade.executable == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		c.upgrade.executable = executable
 	}
-	executableAbsPath := chezmoi.NewAbsPath(executable)
+
+	executableAbsPath := chezmoi.NewAbsPath(c.upgrade.executable)
 	method := c.upgrade.method
 	if method == "" {
 		switch method, err = getUpgradeMethod(c.fileSystem, executableAbsPath); {
@@ -151,7 +159,7 @@ func (c *Config) runUpgradeCmd(cmd *cobra.Command, args []string) error {
 		}
 	}
 	c.logger.Info().
-		Str("executable", executable).
+		Str("executable", c.upgrade.executable).
 		Str("method", method).
 		Msg("upgradeMethod")
 
@@ -170,13 +178,18 @@ func (c *Config) runUpgradeCmd(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	case upgradeMethodUpgradePackage:
-		useSudo := false
-		if err := c.upgradePackage(ctx, version, rr, useSudo); err != nil {
+		prefix := ""
+		if err := c.upgradePackage(ctx, version, rr, prefix); err != nil {
+			return err
+		}
+	case upgradeMethodPfexecPrefix + upgradeMethodUpgradePackage:
+		prefix := "pfexec"
+		if err := c.upgradePackage(ctx, version, rr, prefix); err != nil {
 			return err
 		}
 	case upgradeMethodSudoPrefix + upgradeMethodUpgradePackage:
-		useSudo := true
-		if err := c.upgradePackage(ctx, version, rr, useSudo); err != nil {
+		prefix := ""
+		if err := c.upgradePackage(ctx, version, rr, prefix); err != nil {
 			return err
 		}
 	default:
@@ -185,7 +198,7 @@ func (c *Config) runUpgradeCmd(cmd *cobra.Command, args []string) error {
 
 	// Find the executable. If we replaced the executable directly, then use
 	// that, otherwise look in $PATH.
-	path := executable
+	path := c.upgrade.executable
 	if method != upgradeMethodReplaceExecutable {
 		path, err = exec.LookPath(c.upgrade.repo)
 		if err != nil {
@@ -194,17 +207,11 @@ func (c *Config) runUpgradeCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Execute the new version.
-	arg0 := path
-	argv := []string{arg0, "--version"}
-	c.logger.Info().
-		Str("arg0", arg0).
-		Strs("argv", argv).
-		Msg("exec")
-	err = unix.EINTR
-	for errors.Is(err, unix.EINTR) {
-		err = unix.Exec(arg0, argv, os.Environ())
-	}
-	return err
+	chezmoiVersionCmd := exec.Command(path, "--version")
+	chezmoiVersionCmd.Stdin = os.Stdin
+	chezmoiVersionCmd.Stdout = os.Stdout
+	chezmoiVersionCmd.Stderr = os.Stderr
+	return c.baseSystem.RunIdempotentCmd(chezmoiVersionCmd)
 }
 
 func (c *Config) brewUpgrade() error {
@@ -305,55 +312,69 @@ func (c *Config) getPackageFilename(packageType string, version *semver.Version,
 }
 
 func (c *Config) replaceExecutable(ctx context.Context, executableFilenameAbsPath chezmoi.AbsPath, releaseVersion *semver.Version, rr *github.RepositoryRelease) (err error) {
-	goos := runtime.GOOS
-	if goos == "linux" && runtime.GOARCH == "amd64" {
+	var archiveFormat archive.Format
+	var archiveName string
+	switch {
+	case runtime.GOOS == "windows":
+		archiveFormat = archive.FormatZip
+		archiveName = fmt.Sprintf("%s_%s_%s_%s.zip", c.upgrade.repo, releaseVersion, runtime.GOOS, runtime.GOARCH)
+	case runtime.GOOS == "linux" && runtime.GOARCH == "amd64":
+		archiveFormat = archive.FormatTarGz
 		var libc string
 		if libc, err = c.getLibc(); err != nil {
 			return
 		}
-		goos += "-" + libc
+		archiveName = fmt.Sprintf("%s_%s_%s-%s_%s.tar.gz", c.upgrade.repo, releaseVersion, runtime.GOOS, libc, runtime.GOARCH)
+	default:
+		archiveFormat = archive.FormatTarGz
+		archiveName = fmt.Sprintf("%s_%s_%s_%s.tar.gz", c.upgrade.repo, releaseVersion, runtime.GOOS, runtime.GOARCH)
 	}
-	name := fmt.Sprintf("%s_%s_%s_%s.tar.gz", c.upgrade.repo, releaseVersion, goos, runtime.GOARCH)
-	releaseAsset := getReleaseAssetByName(rr, name)
+	releaseAsset := getReleaseAssetByName(rr, archiveName)
 	if releaseAsset == nil {
-		err = fmt.Errorf("%s: cannot find release asset", name)
+		err = fmt.Errorf("%s: cannot find release asset", archiveName)
 		return
 	}
 
-	var data []byte
-	if data, err = c.downloadURL(ctx, releaseAsset.GetBrowserDownloadURL()); err != nil {
-		return err
+	var archiveData []byte
+	if archiveData, err = c.downloadURL(ctx, releaseAsset.GetBrowserDownloadURL()); err != nil {
+		return
 	}
-	if err = c.verifyChecksum(ctx, rr, releaseAsset.GetName(), data); err != nil {
-		return err
+	if err = c.verifyChecksum(ctx, rr, releaseAsset.GetName(), archiveData); err != nil {
+		return
 	}
 
 	// Extract the executable from the archive.
-	var gzipReader *gzip.Reader
-	if gzipReader, err = gzip.NewReader(bytes.NewReader(data)); err != nil {
-		return err
-	}
-	defer func() {
-		err = multierr.Append(err, gzipReader.Close())
-	}()
-	tarReader := tar.NewReader(gzipReader)
 	var executableData []byte
-FOR:
-	for {
-		var header *tar.Header
-		switch header, err = tarReader.Next(); {
-		case err == nil && header.Name == c.upgrade.repo:
-			if executableData, err = io.ReadAll(tarReader); err != nil {
-				return
+	if err = archive.Walk(archiveData, archiveFormat, func(name string, info fs.FileInfo, r io.Reader, linkname string) error {
+		switch {
+		case runtime.GOOS != "windows" && name == c.upgrade.repo:
+			fallthrough
+		case runtime.GOOS == "windows" && name == c.upgrade.repo+".exe":
+			var err error
+			executableData, err = io.ReadAll(r)
+			if err != nil {
+				return err
 			}
-			break FOR
-		case errors.Is(err, io.EOF):
-			err = fmt.Errorf("%s: could not find header", c.upgrade.repo)
+			return chezmoi.Stop
+		default:
+			return nil
+		}
+	}); err != nil {
+		return
+	}
+	if executableData == nil {
+		err = fmt.Errorf("%s: cannot find executable in archive", archiveName)
+		return
+	}
+
+	// Replace the executable.
+	if runtime.GOOS == "windows" {
+		if err = c.baseSystem.Rename(executableFilenameAbsPath, executableFilenameAbsPath.Append(".old")); err != nil {
 			return
 		}
 	}
-
 	err = c.baseSystem.WriteFile(executableFilenameAbsPath, executableData, 0o755)
+
 	return
 }
 
@@ -361,8 +382,16 @@ func (c *Config) snapRefresh() error {
 	return c.run(chezmoi.EmptyAbsPath, "snap", []string{"refresh", c.upgrade.repo})
 }
 
-func (c *Config) upgradePackage(ctx context.Context, version *semver.Version, rr *github.RepositoryRelease, useSudo bool) error {
+func (c *Config) upgradePackage(ctx context.Context, version *semver.Version, rr *github.RepositoryRelease, prefix string) error {
+	var args []string
+	if prefix != "" {
+		args = append(args, prefix)
+	}
+
 	switch runtime.GOOS {
+	case "illumos":
+		args = append(args, "pkg", "install", "application/"+c.upgrade.repo)
+		return c.run(chezmoi.EmptyAbsPath, args[0], args[1:])
 	case "linux":
 		// Determine the package type and architecture.
 		packageType, err := getPackageType(c.baseSystem)
@@ -373,10 +402,6 @@ func (c *Config) upgradePackage(ctx context.Context, version *semver.Version, rr
 		// chezmoi does not build and distribute AUR packages, so instead rely
 		// on pacman and the community package.
 		if packageType == packageTypeAUR {
-			var args []string
-			if useSudo {
-				args = append(args, "sudo")
-			}
 			args = append(args, "pacman", "-S", c.upgrade.repo)
 			return c.run(chezmoi.EmptyAbsPath, args[0], args[1:])
 		}
@@ -411,10 +436,6 @@ func (c *Config) upgradePackage(ctx context.Context, version *semver.Version, rr
 		}
 
 		// Install the package from disk.
-		var args []string
-		if useSudo {
-			args = append(args, "sudo")
-		}
 		switch packageType {
 		case packageTypeAPK:
 			args = append(args, "apk", "--allow-untrusted", packageAbsPath.String())
@@ -448,6 +469,8 @@ func (c *Config) verifyChecksum(ctx context.Context, rr *github.RepositoryReleas
 // getUpgradeMethod attempts to determine the method by which chezmoi can be
 // upgraded by looking at how it was installed.
 func getUpgradeMethod(fileSystem vfs.Stater, executableAbsPath chezmoi.AbsPath) (string, error) {
+	// If the executable was installed by a per-user package manager, then use
+	// it.
 	switch {
 	case runtime.GOOS == "darwin" && strings.Contains(executableAbsPath.String(), "/homebrew/"):
 		return upgradeMethodBrewUpgrade, nil
@@ -457,17 +480,21 @@ func getUpgradeMethod(fileSystem vfs.Stater, executableAbsPath chezmoi.AbsPath) 
 
 	// If the executable is in the user's home directory, then always use
 	// replace-executable.
-	userHomeDir, err := os.UserHomeDir()
-	if err != nil {
+	switch userHomeDir, err := os.UserHomeDir(); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
 		return "", err
-	}
-	if executableInUserHomeDir, err := vfs.Contains(fileSystem, executableAbsPath.String(), userHomeDir); err != nil {
-		return "", err
-	} else if executableInUserHomeDir {
-		return upgradeMethodReplaceExecutable, nil
+	default:
+		switch executableInUserHomeDir, err := vfs.Contains(fileSystem, executableAbsPath.String(), userHomeDir); {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return "", err
+		case executableInUserHomeDir:
+			return upgradeMethodReplaceExecutable, nil
+		}
 	}
 
-	// If the executable is in the system's temporary directory, then always use
+	// If the executable is in the system's temporary directory, then use
 	// replace-executable.
 	if executableIsInTempDir, err := vfs.Contains(fileSystem, executableAbsPath.String(), os.TempDir()); err != nil {
 		return "", err
@@ -475,42 +502,39 @@ func getUpgradeMethod(fileSystem vfs.Stater, executableAbsPath chezmoi.AbsPath) 
 		return upgradeMethodReplaceExecutable, nil
 	}
 
+	// If the system does not have chezmoi in its default package manager, then
+	// use replace-executable.
 	switch runtime.GOOS {
 	case "darwin":
-		return upgradeMethodReplaceExecutable, nil
+		fallthrough
 	case "freebsd":
-		return upgradeMethodReplaceExecutable, nil
-	case "linux":
-		if ok, _ := vfs.Contains(fileSystem, executableAbsPath.String(), "/snap"); ok {
-			return upgradeMethodSnapRefresh, nil
-		}
-
-		info, err := fileSystem.Stat(executableAbsPath.String())
-		if err != nil {
-			return "", err
-		}
-		//nolint:forcetypeassert
-		executableStat := info.Sys().(*syscall.Stat_t)
-		uid := os.Getuid()
-		switch int(executableStat.Uid) {
-		case 0:
-			method := upgradeMethodUpgradePackage
-			if uid != 0 {
-				if _, err := exec.LookPath("sudo"); err == nil {
-					method = upgradeMethodSudoPrefix + method
-				}
-			}
-			return method, nil
-		case uid:
-			return upgradeMethodReplaceExecutable, nil
-		default:
-			return "", fmt.Errorf("%s: cannot upgrade executable owned by non-current non-root user", executableAbsPath)
-		}
+		fallthrough
 	case "openbsd":
+		fallthrough
+	case "windows":
 		return upgradeMethodReplaceExecutable, nil
-	default:
-		return "", nil
 	}
+
+	// Otherwise, determine if the executable was installed by the system's
+	// package manager.
+	info, err := fileSystem.Stat(executableAbsPath.String())
+	if err != nil {
+		return "", err
+	}
+	if fileInfoUID(info) == 0 {
+		switch {
+		case os.Getuid() == 0:
+			// Already running as root, no prefix needed.
+		case runtime.GOOS == "linux":
+			return upgradeMethodSudoPrefix + upgradeMethodUpgradePackage, nil
+		case runtime.GOOS == "illumos":
+			return upgradeMethodPfexecPrefix + upgradeMethodUpgradePackage, nil
+		}
+		return upgradeMethodUpgradePackage, nil
+	}
+
+	// Fall back to replace-executable.
+	return upgradeMethodReplaceExecutable, nil
 }
 
 // getPackageType returns the distributions package type based on is OS release.
@@ -519,19 +543,21 @@ func getPackageType(system chezmoi.System) (string, error) {
 	if err != nil {
 		return packageTypeNone, err
 	}
-	if id, ok := osRelease["ID"].(string); ok {
+	id, ok := osRelease["ID"].(string)
+	if ok {
 		if packageType, ok := packageTypeByID[id]; ok {
 			return packageType, nil
 		}
 	}
-	if idLikes, ok := osRelease["ID_LIKE"].(string); ok {
-		for _, id := range strings.Split(idLikes, " ") {
+	idLike, ok := osRelease["ID_LIKE"].(string)
+	if ok {
+		for _, id := range strings.Split(idLike, " ") {
 			if packageType, ok := packageTypeByID[id]; ok {
 				return packageType, nil
 			}
 		}
 	}
-	return packageTypeNone, fmt.Errorf("could not determine package type (ID=%q, ID_LIKE=%q)", osRelease["ID"], osRelease["ID_LIKE"])
+	return packageTypeNone, fmt.Errorf("could not determine package type (ID=%q, ID_LIKE=%q)", id, idLike)
 }
 
 // getReleaseAssetByName returns the release asset from rr with the given name.

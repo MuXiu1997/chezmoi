@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"io/fs"
 	"path/filepath"
 	"regexp"
@@ -17,6 +18,9 @@ var (
 
 	// Skip indicates that entry should be skipped.
 	Skip = filepath.SkipDir
+
+	// Stop indicates that the walk should be stopped.
+	Stop = io.EOF
 
 	// Umask is the process's umask.
 	Umask = fs.FileMode(0)

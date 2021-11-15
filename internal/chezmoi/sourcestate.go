@@ -29,6 +29,8 @@ import (
 	"github.com/rs/zerolog/log"
 	vfs "github.com/twpayne/go-vfs/v4"
 	"go.uber.org/multierr"
+
+	"github.com/twpayne/chezmoi/v2/internal/archive"
 )
 
 // An ExternalType is a type of external source.
@@ -50,10 +52,10 @@ type External struct {
 		Command string   `json:"command" toml:"command" yaml:"command"`
 		Args    []string `json:"args" toml:"args" yaml:"args"`
 	} `json:"filter" toml:"filter" yaml:"filter"`
-	Format          ArchiveFormat `json:"format" toml:"format" yaml:"format"`
-	RefreshPeriod   time.Duration `json:"refreshPeriod" toml:"refreshPeriod" yaml:"refreshPeriod"`
-	StripComponents int           `json:"stripComponents" toml:"stripComponents" yaml:"stripComponents"`
-	URL             string        `json:"url" toml:"url" yaml:"url"`
+	Format          archive.Format `json:"format" toml:"format" yaml:"format"`
+	RefreshPeriod   time.Duration  `json:"refreshPeriod" toml:"refreshPeriod" yaml:"refreshPeriod"`
+	StripComponents int            `json:"stripComponents" toml:"stripComponents" yaml:"stripComponents"`
+	URL             string         `json:"url" toml:"url" yaml:"url"`
 }
 
 // A externalCacheEntry is an external cache entry.
@@ -1629,12 +1631,12 @@ func (s *SourceState) readExternalArchive(ctx context.Context, externalRelPath R
 	}
 
 	format := external.Format
-	if format == ArchiveFormatUnknown {
-		format = GuessArchiveFormat(urlPath, data)
+	if format == archive.FormatUnknown {
+		format = archive.GuessFormat(urlPath, data)
 	}
 
 	sourceRelPaths := make(map[RelPath]SourceRelPath)
-	if err := walkArchive(data, format, func(name string, info fs.FileInfo, r io.Reader, linkname string) error {
+	if err := archive.Walk(data, format, func(name string, info fs.FileInfo, r io.Reader, linkname string) error {
 		if external.StripComponents > 0 {
 			components := strings.Split(name, "/")
 			if len(components) <= external.StripComponents {

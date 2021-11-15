@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/twpayne/chezmoi/v2/internal/archive"
 )
 
 func TestArchiveReaderSystemTAR(t *testing.T) {
@@ -36,7 +38,7 @@ func TestArchiveReaderSystemTAR(t *testing.T) {
 	}))
 	require.NoError(t, tarWriter.Close())
 
-	archiveReaderSystem, err := NewArchiveReaderSystem("archive.tar", buffer.Bytes(), ArchiveFormatTar, ArchiveReaderSystemOptions{
+	archiveReaderSystem, err := NewArchiveReaderSystem("archive.tar", buffer.Bytes(), archive.FormatTar, ArchiveReaderSystemOptions{
 		RootAbsPath:     NewAbsPath("/home/user"),
 		StripComponents: 1,
 	})

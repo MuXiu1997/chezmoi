@@ -1,0 +1,9 @@
+[!net] skip 'network access required'
+
+# test that chezmoi upgrade succeeds
+[windows] chezmoi upgrade --executable=$WORK\chezmoi.exe --method=replace-executable
+[!windows] chezmoi upgrade --executable=$WORK/chezmoi
+exec $WORK/chezmoi${exe} --version
+
+-- chezmoi --
+-- chezmoi.exe --

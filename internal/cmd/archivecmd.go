@@ -10,12 +10,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/twpayne/chezmoi/v2/internal/archive"
 	"github.com/twpayne/chezmoi/v2/internal/chezmoi"
 )
 
 type archiveCmdConfig struct {
 	exclude   *chezmoi.EntryTypeSet
-	format    chezmoi.ArchiveFormat
+	format    archive.Format
 	gzip      bool
 	include   *chezmoi.EntryTypeSet
 	init      bool
@@ -47,15 +48,15 @@ func (c *Config) newArchiveCmd() *cobra.Command {
 
 func (c *Config) runArchiveCmd(cmd *cobra.Command, args []string) error {
 	format := c.archive.format
-	if format == chezmoi.ArchiveFormatUnknown {
-		format = chezmoi.GuessArchiveFormat(c.outputAbsPath.String(), nil)
-		if format == chezmoi.ArchiveFormatUnknown {
-			format = chezmoi.ArchiveFormatTar
+	if format == archive.FormatUnknown {
+		format = archive.GuessFormat(c.outputAbsPath.String(), nil)
+		if format == archive.FormatUnknown {
+			format = archive.FormatTar
 		}
 	}
 
 	gzipOutput := c.archive.gzip
-	if format == chezmoi.ArchiveFormatTarGz || format == chezmoi.ArchiveFormatTgz {
+	if format == archive.FormatTarGz || format == archive.FormatTgz {
 		gzipOutput = true
 	}
 
@@ -65,12 +66,12 @@ func (c *Config) runArchiveCmd(cmd *cobra.Command, args []string) error {
 		Close() error
 	}
 	switch format {
-	case chezmoi.ArchiveFormatTar, chezmoi.ArchiveFormatTarGz, chezmoi.ArchiveFormatTgz:
+	case archive.FormatTar, archive.FormatTarGz, archive.FormatTgz:
 		archiveSystem = chezmoi.NewTARWriterSystem(&output, tarHeaderTemplate())
-	case chezmoi.ArchiveFormatZip:
+	case archive.FormatZip:
 		archiveSystem = chezmoi.NewZIPWriterSystem(&output, time.Now().UTC())
 	default:
-		return chezmoi.InvalidArchiveFormatError(format)
+		return archive.InvalidFormatError(format)
 	}
 	if err := c.applyArgs(cmd.Context(), archiveSystem, chezmoi.EmptyAbsPath, args, applyArgsOptions{
 		include:   c.archive.include.Sub(c.archive.exclude),
@@ -83,7 +84,7 @@ func (c *Config) runArchiveCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if format == chezmoi.ArchiveFormatZip || !gzipOutput {
+	if format == archive.FormatZip || !gzipOutput {
 		return c.writeOutputString(output.String())
 	}
 

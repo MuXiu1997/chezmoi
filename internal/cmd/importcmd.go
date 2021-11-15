@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/twpayne/chezmoi/v2/internal/archive"
 	"github.com/twpayne/chezmoi/v2/internal/chezmoi"
 )
 
@@ -66,7 +67,7 @@ func (c *Config) runImportCmd(cmd *cobra.Command, args []string, sourceState *ch
 			return err
 		}
 	}
-	archiveReaderSystem, err := chezmoi.NewArchiveReaderSystem(name, data, chezmoi.ArchiveFormatUnknown, chezmoi.ArchiveReaderSystemOptions{
+	archiveReaderSystem, err := chezmoi.NewArchiveReaderSystem(name, data, archive.FormatUnknown, chezmoi.ArchiveReaderSystemOptions{
 		RootAbsPath:     c._import.destination,
 		StripComponents: c._import.stripComponents,
 	})
